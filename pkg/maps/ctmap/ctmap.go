@@ -103,6 +103,9 @@ type NatMap interface {
 	Open() error
 	Close() error
 	DeleteMapping(key tuple.TupleKey) error
+	DumpWithCallback(bpf.DumpCallback) error
+	Foo(bpf.DumpCallback, *bpf.DumpStats) error
+	Delete(bpf.MapKey) error
 }
 
 type mapAttributes struct {
@@ -381,6 +384,49 @@ func purgeCtEntry4(m *Map, key CtKey, natMap NatMap) error {
 		natMap.DeleteMapping(key.GetTupleKey())
 	}
 	return err
+}
+
+func PurgeOrphanNATEntries4(ctMap *Map) {
+	natMap := mapInfo[ctMap.mapType].natMap
+	if natMap == nil {
+		return
+	}
+
+	cb := func(key bpf.MapKey, value bpf.MapValue) {
+		natKey := key.(*nat.NatKey4)
+		natVal := value.(*nat.NatEntry4)
+
+		// Construct CT tuple
+		var ctKey tuple.TupleKey4Global
+		if natKey.GetFlags()&tuple.TUPLE_F_IN == 0 { // dir == CT_EGRESS
+			ctKey.Flags = tuple.TUPLE_F_OUT
+			ctKey.SourceAddr = natKey.DestAddr
+			ctKey.DestAddr = natKey.SourceAddr
+			ctKey.SourcePort = natKey.SourcePort
+			ctKey.DestPort = natKey.DestPort
+			ctKey.NextHeader = natKey.NextHeader
+		}
+
+		if _, err := ctMap.Lookup(&ctKey); err != nil { // TODO(brb) check for ENOENT
+			// No CT entry is found, so delete natKey for both original and reverse flows
+			rNatKey := *natKey
+			rNatKey.Flags = tuple.TUPLE_F_IN
+			rNatKey.SourceAddr = natKey.DestAddr
+			rNatKey.SourcePort = natKey.DestPort
+			rNatKey.DestAddr = natVal.Addr
+			rNatKey.DestPort = natVal.Port
+			rNatKey.NextHeader = natKey.NextHeader
+
+			natMap.Delete(natKey)
+			natMap.Delete(&rNatKey)
+		}
+	}
+	stats := bpf.DumpStats{}
+	err := natMap.Foo(cb, &stats)
+	if err != nil {
+		fmt.Println("!!!", err)
+	}
+	fmt.Println("stats", stats)
 }
 
 // doGC4 iterates through a CTv4 map and drops entries based on the given

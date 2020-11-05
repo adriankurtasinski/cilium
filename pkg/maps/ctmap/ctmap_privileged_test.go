@@ -17,6 +17,7 @@
 package ctmap
 
 import (
+	"fmt"
 	"testing"
 	"unsafe"
 
@@ -210,4 +211,150 @@ func (k *CTMapTestSuite) TestCtGcIcmp(c *C) {
 	err = natMap.Map.Dump(buf)
 	c.Assert(err, IsNil)
 	c.Assert(len(buf), Equals, 0)
+}
+
+// TestOrphanNat (GH#12686)
+func (k *CTMapTestSuite) TestOrphanNat(c *C) {
+	bpf.CheckOrMountFS("", false)
+	err := bpf.ConfigureResourceLimits()
+	c.Assert(err, IsNil)
+
+	// Init maps
+	natMap := nat.NewMap("cilium_nat_any4_test", true, 1000)
+	_, err = natMap.OpenOrCreate()
+	c.Assert(err, IsNil)
+	defer natMap.Map.Unpin()
+
+	ctMapName := MapNameAny4Global + "_test"
+	setupMapInfo(mapTypeIPv4AnyGlobal, ctMapName,
+		&CtKey4Global{}, int(unsafe.Sizeof(CtKey4Global{})),
+		100, natMap)
+
+	ctMap := newMap(ctMapName, mapTypeIPv4AnyGlobal)
+	_, err = ctMap.OpenOrCreate()
+	c.Assert(err, IsNil)
+	defer ctMap.Map.Unpin()
+
+	// Create the following entries and check that they are NOT GC-ed:
+	//	- CT:	UDP OUT 10.23.32.45:54864 -> 10.23.53.48:8472 <..>
+	//	- NAT:	UDP IN  10.23.53.48:8472  -> 10.23.32.45:54864 XLATE_DST <..>
+	//	 		UDP OUT 10.23.32.45:54864 -> 10.23.53.48:8472 XLATE_SRC <..>
+
+	//ctKey := &CtKey4Global{
+	//	tuple.TupleKey4Global{
+	//		tuple.TupleKey4{
+	//			DestAddr:   types.IPv4{10, 23, 32, 45},
+	//			SourceAddr: types.IPv4{10, 23, 53, 48},
+	//			SourcePort: 0x50d6,
+	//			DestPort:   0x1821,
+	//			NextHeader: u8proto.UDP,
+	//			Flags:      tuple.TUPLE_F_OUT,
+	//		},
+	//	},
+	//}
+	//ctVal := &CtEntry{
+	//	TxPackets: 1,
+	//	TxBytes:   216,
+	//	Lifetime:  37459,
+	//}
+	//err = bpf.UpdateElement(ctMap.Map.GetFd(), unsafe.Pointer(ctKey),
+	//	unsafe.Pointer(ctVal), 0)
+	//c.Assert(err, IsNil)
+
+	out, err := ctMap.DumpEntries()
+	c.Assert(err, IsNil)
+	fmt.Println(">>>>>>>>", out)
+
+	natKey := &nat.NatKey4{
+		tuple.TupleKey4Global{
+			tuple.TupleKey4{
+				DestAddr:   types.IPv4{10, 23, 32, 45},
+				SourceAddr: types.IPv4{10, 23, 53, 48},
+				DestPort:   0x50d6,
+				SourcePort: 0x1821,
+				NextHeader: u8proto.UDP,
+				Flags:      tuple.TUPLE_F_IN,
+			},
+		},
+	}
+	natVal := &nat.NatEntry4{
+		Created:   37400,
+		HostLocal: 1,
+		Addr:      types.IPv4{10, 23, 32, 45},
+		Port:      0x50d6,
+	}
+	err = bpf.UpdateElement(natMap.Map.GetFd(), unsafe.Pointer(natKey),
+		unsafe.Pointer(natVal), 0)
+	c.Assert(err, IsNil)
+	natKey = &nat.NatKey4{
+		tuple.TupleKey4Global{
+			tuple.TupleKey4{
+				SourceAddr: types.IPv4{10, 23, 32, 45},
+				DestAddr:   types.IPv4{10, 23, 53, 48},
+				SourcePort: 0x50d6,
+				DestPort:   0x1821,
+				NextHeader: u8proto.UDP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+	err = bpf.UpdateElement(natMap.Map.GetFd(), unsafe.Pointer(natKey),
+		unsafe.Pointer(natVal), 0)
+	c.Assert(err, IsNil)
+
+	out, err = natMap.DumpEntries()
+	c.Assert(err, IsNil)
+	fmt.Println(">>>>>>>>", out)
+
+	PurgeOrphanNATEntries4(ctMap)
+
+	out, err = natMap.DumpEntries()
+	c.Assert(err, IsNil)
+	fmt.Println("~~~~~", out)
+
+	//natKey = &nat.NatKey4{
+	//	tuple.TupleKey4Global{
+	//		tuple.TupleKey4{
+	//			SourceAddr: types.IPv4{192, 168, 34, 12},
+	//			DestAddr:   types.IPv4{192, 168, 34, 11},
+	//			SourcePort: 0,
+	//			DestPort:   0x3195,
+	//			NextHeader: u8proto.ICMP,
+	//			Flags:      1,
+	//		},
+	//	},
+	//}
+	//natVal = &nat.NatEntry4{
+	//	Created:   37400,
+	//	HostLocal: 1,
+	//	Addr:      types.IPv4{192, 168, 34, 11},
+	//	Port:      0x3195,
+	//}
+	//err = bpf.UpdateElement(natMap.Map.GetFd(), unsafe.Pointer(natKey),
+	//	unsafe.Pointer(natVal), 0)
+	//c.Assert(err, IsNil)
+
+	//buf := make(map[string][]string)
+	//err = ctMap.Map.Dump(buf)
+	//c.Assert(err, IsNil)
+	//c.Assert(len(buf), Equals, 1)
+
+	//buf = make(map[string][]string)
+	//err = natMap.Map.Dump(buf)
+	//c.Assert(err, IsNil)
+	//c.Assert(len(buf), Equals, 2)
+
+	//// GC and check whether NAT entries have been collected
+	//filter := &GCFilter{
+	//	RemoveExpired: true,
+	//	Time:          39000,
+	//}
+	//stats := doGC4(ctMap, filter)
+	//c.Assert(stats.aliveEntries, Equals, uint32(0))
+	//c.Assert(stats.deleted, Equals, uint32(1))
+
+	//buf = make(map[string][]string)
+	//err = natMap.Map.Dump(buf)
+	//c.Assert(err, IsNil)
+	//c.Assert(len(buf), Equals, 0)
 }

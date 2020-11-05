@@ -76,6 +76,7 @@ type NatMap interface {
 	Path() (string, error)
 	DumpEntries() (string, error)
 	DumpWithCallback(bpf.DumpCallback) error
+	Delete(bpf.MapKey) error
 }
 
 // NatDumpCreated returns time in seconds when NAT entry was created.
@@ -117,6 +118,14 @@ func NewMap(name string, v4 bool, entries int) *Map {
 		).WithCache(),
 		v4: v4,
 	}
+}
+
+func (m *Map) Delete(k bpf.MapKey) error {
+	return m.Map.Delete(k)
+}
+
+func (m *Map) Foo(cb bpf.DumpCallback, stats *bpf.DumpStats) error {
+	return m.DumpReliablyWithCallback(cb, stats)
 }
 
 // DoDumpEntries iterates through Map m and writes the values of the
